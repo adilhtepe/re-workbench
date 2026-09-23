@@ -1,0 +1,17 @@
+{
+  "name": "re-workbench",
+  "owner": {
+    "name": "adil.tepe"
+  },
+  "metadata": {
+    "description": "Ghidra-powered reverse engineering & firmware analysis workbench for Claude Code",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "re-workbench",
+      "source": "./",
+      "description": "Headless Ghidra decompilation, binary triage, firmware/IoT recon, and autonomous RE — as MCP tools, skills, and an agent"
+    }
+  ]
+}

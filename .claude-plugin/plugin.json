@@ -1,0 +1,22 @@
+{
+  "name": "re-workbench",
+  "version": "0.1.0",
+  "description": "Ghidra-powered reverse engineering and firmware/IoT analysis: headless decompilation, binary triage, firmware unpacking, secret hunting, and protocol analysis for authorized security research and CTFs",
+  "author": {
+    "name": "adil.tepe"
+  },
+  "license": "MIT",
+  "keywords": [
+    "reverse-engineering",
+    "ghidra",
+    "firmware",
+    "iot",
+    "malware",
+    "binary-analysis",
+    "decompiler",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "agents": "./agents/",
+  "mcpServers": "./.mcp.json"
+}

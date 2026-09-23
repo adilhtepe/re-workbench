@@ -1,0 +1,7 @@
+mcp/.venv/
+__pycache__/
+*.pyc
+re-findings/
+.claude-flow/
+.claude/
+mcp/.claude-flow/
