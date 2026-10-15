@@ -17,6 +17,7 @@ pseudo-C alone is a weak signal for naming/understanding.
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -27,9 +28,77 @@ from . import decisions, firmware, ghidra_session
 
 mcp = FastMCP("re-workbench")
 
+#: What replaces a non-finite float on its way out. The decision client already
+#: refuses NaN/Infinity as a score, but one is cheap to produce elsewhere (a
+#: ratio over zero, a value read straight from a reply) and a single one makes
+#: the whole tool result unparseable for a strict JSON client.
+_NOT_A_NUMBER = None
+
+
+def _strict(obj: Any) -> Any:
+    """Replace every non-finite float so the result is valid JSON.
+
+    `json.dumps` defaults to allow_nan=True and emits the bare literals `NaN`,
+    `Infinity` and `-Infinity`, which are not JSON: measured, one NaN in a batch
+    made the whole tool output fail a strict reparse with "bare NaN".
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else _NOT_A_NUMBER
+    if isinstance(obj, dict):
+        return {key: _strict(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_strict(value) for value in obj]
+    return obj
+
 
 def _j(obj: Any) -> str:
-    return json.dumps(obj, indent=2, default=str)
+    # allow_nan=False turns a missed non-finite value into a loud error here
+    # rather than into a quietly unparseable tool result at the client.
+    return json.dumps(_strict(obj), indent=2, default=str, allow_nan=False)
+
+
+def _score_sort_key(candidate: dict[str, Any]) -> tuple[bool, float, int]:
+    """Sort key that is safe against a score that is not a number.
+
+    A NaN comparator is not transitive, so sorting on a raw score moves the
+    CORRECTLY scored items of the batch out of order too: measured ranks from
+    one such batch were 0.28, nan, 0.30, nan, 0.21, 0.32. Anything that is not
+    a finite number sorts after everything that is, and ties fall back to the
+    deterministic rank.
+    """
+    score = candidate.get("score")
+    if (
+        isinstance(score, bool)
+        or not isinstance(score, (int, float))
+        or not math.isfinite(float(score))
+    ):
+        return (True, 0.0, candidate["deterministic_rank"])
+    return (False, -float(score), candidate["deterministic_rank"])
+
+
+def _apply_ranks(
+    selected: list[dict[str, Any]], ranked_by_score: bool
+) -> tuple[int, int]:
+    """Number the ranked items 1..N and leave the unscored ones rank null.
+
+    An item that was never asked about must not get a rank number at the bottom
+    of a score-ordered list: to a reader that is indistinguishable from "the
+    model ranked it last". Returns (ranked, unscored).
+    """
+    position = 0
+    unscored = 0
+    for candidate in selected:
+        if ranked_by_score and candidate.get("score") is None:
+            candidate["rank"] = None
+            candidate["rank_note"] = (
+                "not scored, so not ranked: this item was never asked about, "
+                "which is not the same as scoring low"
+            )
+            unscored += 1
+            continue
+        position += 1
+        candidate["rank"] = position
+    return position, unscored
 
 
 # --------------------------------------------------------------------------
@@ -260,17 +329,9 @@ def decompile(
         out["callers"] = callers
 
     if include_strings:
-        strings = []
-        listing = prog.getListing()
-        body = f.getBody()
-        data_iter = prog.getReferenceManager()
-        for addr in body.getAddresses(True):
-            for ref in data_iter.getReferencesFrom(addr):
-                to = ref.getToAddress()
-                d = listing.getDataAt(to)
-                if d is not None and d.hasStringValue():
-                    strings.append(str(d.getValue()))
-        out["referenced_strings"] = sorted(set(strings))[:100]
+        # Instructions carry the references; walking every byte of the body
+        # costs one JVM round-trip per address for the same answer.
+        out["referenced_strings"] = _function_strings(prog, f, 100)
 
     return _j(out)
 
@@ -425,36 +486,43 @@ def _xref_count(prog, addr) -> int:
 
 
 def _imported_calls(f, limit: int = 8) -> list[str]:
-    """Names of imported/thunked functions this function calls, sorted."""
+    """Names of imported/thunked functions this function calls, sorted.
+
+    Raises on an API failure instead of returning []: an empty list renders as
+    "imported calls: none", which a reader cannot tell apart from a function
+    that genuinely calls nothing. The caller counts the failures and says so.
+    """
     names = set()
-    try:
-        for callee in f.getCalledFunctions(None):
-            try:
-                if callee.isExternal() or callee.isThunk():
-                    names.add(callee.getName())
-            except Exception:
-                continue
-    except Exception:
-        return []
+    for callee in f.getCalledFunctions(None):
+        try:
+            if callee.isExternal() or callee.isThunk():
+                names.add(callee.getName())
+        except Exception:
+            continue
     return sorted(names)[:limit]
 
 
-def _referenced_strings(prog, f, limit: int = 4) -> list[str]:
-    """String literals referenced from inside the function body, sorted."""
+def _function_strings(prog, f, limit: int) -> list[str]:
+    """String literals referenced from inside a function body, sorted.
+
+    Iterating `body.getAddresses(True)` walks every BYTE of the function and
+    issues getReferencesFrom + getDataAt per address: for 50 functions
+    averaging 1 KB that is ~100k JVM round-trips in one call, dwarfing the
+    decision requests it exists to feed. References hang off instructions, so
+    iterate the instructions in the body instead.
+
+    Raises on an API failure; see _imported_calls.
+    """
     listing = prog.getListing()
-    rm = prog.getReferenceManager()
     body = f.getBody()
     if body is None:
         return []
     found = set()
-    try:
-        for addr in body.getAddresses(True):
-            for ref in rm.getReferencesFrom(addr):
-                d = listing.getDataAt(ref.getToAddress())
-                if d is not None and d.hasStringValue():
-                    found.add(str(d.getValue()))
-    except Exception:
-        pass
+    for insn in listing.getInstructions(body, True):
+        for ref in insn.getReferencesFrom():
+            data = listing.getDataAt(ref.getToAddress())
+            if data is not None and data.hasStringValue():
+                found.add(str(data.getValue()))
     return sorted(found)[:limit]
 
 
@@ -505,21 +573,103 @@ def _rank_envelope(
     if scoring.get("reason"):
         out["reason"] = scoring["reason"]
     out.update(extra)
-    for field in ("scored", "clamped_evidence", "usage", "elapsed_s", "errors"):
+    for field in (
+        "scored",
+        "unscored",
+        "clamped_evidence",
+        "evidence_shapes_sent",
+        "evidence_shape_warning",
+        "max_items",
+        "max_seconds",
+        "aborted",
+        "usage",
+        "elapsed_s",
+        "errors",
+    ):
         if field in scoring:
             out[field] = scoring[field]
+    if scoring.get("usage", {}).get("requests"):
+        # Only claim a cost once one has actually been paid. The estimate used
+        # to be emitted with the result even when no request had been sent.
+        out["estimated_seconds_for_this_batch"] = extra.get("_estimate")
+    out.pop("_estimate", None)
+    out["caveats"] = list(decisions.CAVEATS)
+    return out
+
+
+#: One sentence, shared by both ranking tools, about how to see the cost first.
+_COST_NOTE = (
+    "This number is a measurement AFTER the fact. To see the cost before "
+    "paying it, call the same tool with dry_run=True (deterministic list plus "
+    "the estimate, no request sent) or decision_status() for the per-batch "
+    "estimate."
+)
+
+
+def _dry_run(
+    question: str,
+    question_id: str,
+    item_count: int,
+    estimate: float,
+    extra: dict[str, Any],
+) -> dict[str, Any]:
+    """Pre-flight result: the deterministic list and the cost, nothing asked.
+
+    This sends NO request, not even a probe: a pre-flight that costs a round
+    trip to report what a round trip costs is the thing it is meant to replace.
+    So it reports the configuration only; call decision_status() separately if
+    reachability matters.
+    """
+    try:
+        config = decisions.DecisionConfig.from_env()
+        server_info: dict[str, Any] = {
+            "configured": config is not None,
+            "reachable": "not checked: a dry run sends no request",
+            "model": config.model if config else None,
+            "url": config.url if config else None,
+            "max_items": config.max_items if config else None,
+            "max_seconds": config.max_seconds if config else None,
+        }
+    except decisions.DecisionConfigError as exc:
+        server_info = {"configured": True, "reachable": False, "reason": str(exc)}
+    out: dict[str, Any] = {
+        "status": "dry_run",
+        "ranking": "deterministic_fallback",
+        "question": question,
+        "question_id": question_id,
+        "template_version": decisions.EVIDENCE_TEMPLATE_VERSION,
+        "decision_server": server_info,
+        "requests_planned": item_count,
+        "estimated_seconds": estimate,
+        "note": (
+            "DRY RUN: no request was sent and no item was scored. The list below "
+            "is in deterministic order. Re-run with dry_run=False to spend the "
+            f"estimated {estimate}s."
+        ),
+    }
+    extra.pop("_estimate", None)
+    out.update(extra)
     out["caveats"] = list(decisions.CAVEATS)
     return out
 
 
 @mcp.tool()
 def rank_functions(
-    path: str, question: str, min_size: int = 0, limit: int = 50
+    path: str,
+    question: str,
+    min_size: int = 0,
+    limit: int = 50,
+    dry_run: bool = False,
 ) -> str:
     """ORDER a function list by one question, using the optional local decision
-    model. This is a sort key, NOT a judgement: every candidate is returned,
-    nothing is filtered out, and no suspicious/clean or important/unimportant
-    label is produced. A LOW SCORE IS NOT A NEGATIVE ANSWER and is never a
+    model. SCORING drops nothing: every candidate that reaches the scoring step
+    is returned with its score, and no suspicious/clean or
+    important/unimportant label is produced. Candidate SELECTION, however, is a
+    filter: `limit` (default 50) and `min_size` cut the list deterministically
+    before any scoring, and `functions_total` vs `candidates_total` vs
+    `candidates_selected` in the result say how many functions each step left
+    behind — absent from the output does NOT mean unimportant. This is a sort
+    key, not a judgement. A LOW SCORE IS NOT A NEGATIVE ANSWER and is never a
     reason to skip a function — a measured true positive (96 bytes, 14 inbound
     refs, only memcpy) scored 0.1790 and came last of nine candidates.
 
@@ -537,8 +687,12 @@ def rank_functions(
     count) and its deterministic rank, so you can see where the model disagrees
     with plain reference counting. With no decision server configured the same
     full list is returned in deterministic order and status is "unavailable".
-    Scores must be calibrated on your own labelled data (eval/calibrate.py)
-    before the order is worth anything; treat it as a hint, never as evidence.
+
+    `dry_run=True` returns that deterministic list and the wall-clock estimate
+    WITHOUT sending a single request, so the cost can be read before it is
+    paid. Scores must be calibrated on your own labelled data
+    (eval/calibrate.py) before the order is worth anything; treat it as a hint,
+    never as evidence.
     """
     try:
         _, prog = _program(path)
@@ -547,13 +701,19 @@ def rank_functions(
 
     fm = prog.getFunctionManager()
     candidates = []
+    functions_total = 0
+    excluded_external = 0
+    excluded_min_size = 0
     for f in fm.getFunctions(True):
+        functions_total += 1
         body = f.getBody()
         size = body.getNumAddresses() if body else 0
         if size < min_size:
+            excluded_min_size += 1
             continue
         try:
             if f.isExternal():
+                excluded_external += 1
                 continue
         except Exception:
             pass
@@ -572,12 +732,32 @@ def rank_functions(
     candidates.sort(key=lambda c: (-c["xref_count"], -c["size"], c["name"]))
     selected = candidates[: max(0, limit)]
 
+    enrichment_errors: list[dict[str, str]] = []
+
+    def enrich(candidate, field, getter):
+        """Run one enrichment step, counting a failure instead of hiding it."""
+        try:
+            return getter()
+        except Exception as exc:  # a Ghidra API failure, not a missing value
+            enrichment_errors.append(
+                {"entry": candidate["entry"], "field": field,
+                 "error": f"{type(exc).__name__}: {exc}"}
+            )
+            candidate["enrichment_error"] = (
+                f"{field}: {type(exc).__name__}: {exc}"
+            )
+            return []
+
     items = []
     for position, c in enumerate(selected, start=1):
         c["deterministic_rank"] = position
         c["fallback_rank_key"] = c["xref_count"]
-        c["imported_calls"] = _imported_calls(c["_f"])
-        c["referenced_strings"] = _referenced_strings(prog, c["_f"])
+        c["imported_calls"] = enrich(
+            c, "imported calls", lambda f=c["_f"]: _imported_calls(f)
+        )
+        c["referenced_strings"] = enrich(
+            c, "referenced strings", lambda f=c["_f"]: _function_strings(prog, f, 4)
+        )
         evidence, clamped = decisions.function_evidence(
             c["name"],
             c["size"],
@@ -595,6 +775,41 @@ def rank_functions(
     )
     announced = decisions.estimate_batch_seconds(len(items), tokens)
 
+    extra = {
+        "path": str(Path(path).resolve()),
+        "functions_total": functions_total,
+        "excluded_external": excluded_external,
+        "excluded_below_min_size": excluded_min_size,
+        "candidates_total": total,
+        "candidates_selected": len(selected),
+        "not_selected": total - len(selected),
+        "min_size": min_size,
+        "limit": limit,
+        "selection": (
+            "deterministic: external stubs excluded, size >= min_size, then "
+            "ordered by inbound reference count, size, name; first `limit` "
+            "kept. functions_total is every function in the program, "
+            "candidates_total what survived min_size and the external filter, "
+            "candidates_selected what `limit` kept and the only ones scored"
+        ),
+        "_estimate": announced,
+    }
+    if enrichment_errors:
+        extra["enrichment_failed"] = len(enrichment_errors)
+        extra["enrichment_errors"] = enrichment_errors[:20]
+        extra["enrichment_warning"] = (
+            f"{len(enrichment_errors)} evidence field(s) could not be read from "
+            "Ghidra and render as 'none', which is indistinguishable from "
+            "genuinely having none. The order of this call is not meaningful "
+            "for the affected items."
+        )
+
+    if dry_run:
+        out = _dry_run(question, "rank_functions", len(items), announced, extra)
+        _apply_ranks(selected, ranked_by_score=False)
+        out["functions"] = selected
+        return _j(out)
+
     scoring = decisions.score_items(
         items,
         "rank_functions",
@@ -609,42 +824,32 @@ def rank_functions(
         if entry.get("error"):
             c["score_error"] = entry["error"]
 
-    if scoring.get("status") in ("ok", "partial"):
-        selected.sort(
-            key=lambda c: (
-                c["score"] is None,
-                -(c["score"] if c["score"] is not None else 0.0),
-                c["deterministic_rank"],
-            )
+    ranked_by_score = scoring.get("status") in ("ok", "partial")
+    if ranked_by_score:
+        selected.sort(key=_score_sort_key)
+    ranked, unranked = _apply_ranks(selected, ranked_by_score)
+    extra["ranked"] = ranked
+    extra["unranked"] = unranked
+    if unranked:
+        extra["unranked_note"] = (
+            f"{unranked} item(s) carry rank null: they were never asked about "
+            "(see each one's score_error), which is not the same as ranking low"
         )
-    for position, c in enumerate(selected, start=1):
-        c["rank"] = position
 
-    out = _rank_envelope(
-        scoring,
-        question,
-        "rank_functions",
-        {
-            "path": str(Path(path).resolve()),
-            "candidates_total": total,
-            "candidates_selected": len(selected),
-            "min_size": min_size,
-            "limit": limit,
-            "estimated_seconds_before_run": announced,
-            "selection": (
-                "deterministic: external stubs excluded, size >= min_size, then "
-                "ordered by inbound reference count, size, name; first `limit` "
-                "kept. candidates_total counts what reached this ordering"
-            ),
-        },
-    )
+    out = _rank_envelope(scoring, question, "rank_functions", extra)
+    if "estimated_seconds_for_this_batch" in out:
+        out["cost_note"] = _COST_NOTE
     out["functions"] = selected
     return _j(out)
 
 
 @mcp.tool()
 def rank_strings(
-    path: str, question: str, pattern: str = "", limit: int = 150
+    path: str,
+    question: str,
+    pattern: str = "",
+    limit: int = 150,
+    dry_run: bool = False,
 ) -> str:
     """ORDER interesting strings by one question. Same contract as
     rank_functions: a sort key, not a judgement; every candidate that passed
@@ -662,10 +867,18 @@ def rank_strings(
     reference counts are reported as unknown here; use xrefs(path, string) to
     resolve one.
 
+    `matched_classes` and `fallback_rank_key` mean the same thing whether or
+    not a custom `pattern` is given: the named classes are always computed as a
+    description of the string, and the fallback key is always the number of
+    matched classes, then length. `pattern` only decides which strings are
+    candidates.
+
     Keep `question` to ONE concrete condition. With no decision server
     configured the same full list comes back ordered by the deterministic
-    fallback key (number of matched pattern classes, then length) and status is
-    "unavailable". Calibrate with eval/calibrate.py before trusting the order.
+    fallback key and status is "unavailable". `dry_run=True` returns that list
+    and the wall-clock estimate without sending a request, so the cost can be
+    read before it is paid. Calibrate with eval/calibrate.py before trusting
+    the order.
     """
     p = Path(path)
     if not p.exists():
@@ -678,15 +891,29 @@ def rank_strings(
     except re.error as e:
         return _j({"error": f"bad pattern {pattern!r}: {e}"})
 
-    extracted = firmware.extract_strings(str(p), min_len=5, encoding="both", limit=200000)
+    min_len = 5
+    extract_limit = 200000
+    extracted = firmware.extract_strings(
+        str(p), min_len=min_len, encoding="both", limit=extract_limit
+    )
     ranges = _section_ranges(str(p))
 
+    # `count` is the untruncated total; `strings` is cut to extract_limit. The
+    # pre-filter only ever sees the truncated list, so reporting `count` as the
+    # number examined would claim the tail of a large image was looked at.
+    examined = extracted.get("strings", [])
+    truncated = bool(extracted.get("truncated"))
+
     candidates = []
-    for s in extracted.get("strings", []):
+    for s in examined:
         text = s["s"]
         if not matcher.search(text):
             continue
-        classes = decisions.classify_string(text) if not pattern else []
+        # Always computed: the classes describe the string, they do not select
+        # it. Forcing them to [] under a custom pattern silently turned
+        # fallback_rank_key into plain string length and collapsed the first two
+        # keys of the deterministic sort into the same value.
+        classes = decisions.classify_string(text)
         candidates.append(
             {
                 "string": text,
@@ -695,7 +922,7 @@ def rank_strings(
                 "encoding": s["enc"],
                 "section": _section_at(s["offset"], ranges),
                 "matched_classes": classes,
-                "fallback_rank_key": len(classes) if not pattern else len(text),
+                "fallback_rank_key": len(classes),
             }
         )
 
@@ -724,6 +951,39 @@ def rank_strings(
     )
     announced = decisions.estimate_batch_seconds(len(items), tokens)
 
+    extra = {
+        "path": str(p.resolve()),
+        "strings_extracted": extracted.get("count", 0),
+        "strings_examined": len(examined),
+        "strings_truncated": truncated,
+        "extract_limit": extract_limit,
+        "min_len": min_len,
+        "prefilter_matched": matched,
+        "candidates_selected": len(selected),
+        "not_selected": matched - len(selected),
+        "limit": limit,
+        "pattern": pattern or "<default pattern set>",
+        "pattern_classes": [name for name, _ in decisions.DEFAULT_STRING_PATTERNS],
+        "selection": (
+            "deterministic regex pre-filter over the extracted strings, then by "
+            "matched class count, length, offset; first `limit` kept"
+        ),
+        "_estimate": announced,
+    }
+    if truncated:
+        extra["truncation_warning"] = (
+            f"string extraction stopped at extract_limit={extract_limit}: "
+            f"{extracted.get('count', 0)} strings were found but only the first "
+            f"{len(examined)} (by file offset) reached the pre-filter, so the "
+            "tail of the file was not examined at all"
+        )
+
+    if dry_run:
+        out = _dry_run(question, "rank_strings", len(items), announced, extra)
+        _apply_ranks(selected, ranked_by_score=False)
+        out["strings"] = selected
+        return _j(out)
+
     scoring = decisions.score_items(items, "rank_strings", question, config=None)
     scores = scoring.get("scores") or {}
     for c in selected:
@@ -733,40 +993,21 @@ def rank_strings(
         if entry.get("error"):
             c["score_error"] = entry["error"]
 
-    if scoring.get("status") in ("ok", "partial"):
-        selected.sort(
-            key=lambda c: (
-                c["score"] is None,
-                -(c["score"] if c["score"] is not None else 0.0),
-                c["deterministic_rank"],
-            )
+    ranked_by_score = scoring.get("status") in ("ok", "partial")
+    if ranked_by_score:
+        selected.sort(key=_score_sort_key)
+    ranked, unranked = _apply_ranks(selected, ranked_by_score)
+    extra["ranked"] = ranked
+    extra["unranked"] = unranked
+    if unranked:
+        extra["unranked_note"] = (
+            f"{unranked} item(s) carry rank null: they were never asked about "
+            "(see each one's score_error), which is not the same as ranking low"
         )
-    for position, c in enumerate(selected, start=1):
-        c["rank"] = position
 
-    out = _rank_envelope(
-        scoring,
-        question,
-        "rank_strings",
-        {
-            "path": str(p.resolve()),
-            "strings_extracted": extracted.get("count", 0),
-            "prefilter_matched": matched,
-            "candidates_selected": len(selected),
-            "limit": limit,
-            "pattern": pattern or "<default pattern set>",
-            "pattern_classes": (
-                [name for name, _ in decisions.DEFAULT_STRING_PATTERNS]
-                if not pattern
-                else None
-            ),
-            "estimated_seconds_before_run": announced,
-            "selection": (
-                "deterministic regex pre-filter, then by matched class count, "
-                "length, offset; first `limit` kept"
-            ),
-        },
-    )
+    out = _rank_envelope(scoring, question, "rank_strings", extra)
+    if "estimated_seconds_for_this_batch" in out:
+        out["cost_note"] = _COST_NOTE
     out["strings"] = selected
     return _j(out)
 
@@ -785,6 +1026,10 @@ def decision_status() -> str:
         "RE_WORKBENCH_DECISION_MODEL": decisions.DEFAULT_MODEL,
         "RE_WORKBENCH_DECISION_TIMEOUT": decisions.DEFAULT_TIMEOUT,
         "RE_WORKBENCH_DECISION_MAX_ITEMS": decisions.DEFAULT_MAX_ITEMS,
+        "RE_WORKBENCH_DECISION_MAX_SECONDS": decisions.DEFAULT_MAX_SECONDS,
+        "RE_WORKBENCH_DECISION_MAX_CONSECUTIVE_ERRORS": (
+            decisions.DEFAULT_MAX_CONSECUTIVE_ERRORS
+        ),
     }
     status["evidence"] = {
         "template_version": decisions.EVIDENCE_TEMPLATE_VERSION,
@@ -798,6 +1043,12 @@ def decision_status() -> str:
         "one_request_per_item": True,
         "estimated_seconds_for_50_items": decisions.estimate_batch_seconds(50),
         "estimated_seconds_for_150_items": decisions.estimate_batch_seconds(150),
+        "batch_deadline_seconds": decisions.DEFAULT_MAX_SECONDS,
+        "per_batch_estimate_before_running": (
+            "call rank_functions / rank_strings with dry_run=True: it returns "
+            "the deterministic list and this batch's estimate without sending "
+            "a single request"
+        ),
     }
     status["measured_limits"] = [
         "Latency is super-linear in state length: 76 tokens 0.57 s, 241 tokens "
@@ -813,6 +1064,9 @@ def decision_status() -> str:
         "request per item.",
         "Role labelling did not generalise, hence no persistent write "
         "(rename_function / set_comment) is ever derived from a score.",
+        "Per-request timeouts are additive: 5 items against a sleeping server "
+        "with a 1 s per-request timeout took 5.03 s, so every batch runs under "
+        f"one wall-clock deadline ({decisions.DEFAULT_MAX_SECONDS}s by default).",
     ]
     status["caveats"] = list(decisions.CAVEATS)
     return _j(status)
