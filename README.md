@@ -56,7 +56,7 @@ runs automatically on first launch.
 ### Claude Code (plugin)
 
 ```
-/plugin install re-workbench@https://github.com/YOUR_USERNAME/re-workbench
+/plugin install re-workbench@https://github.com/adilhtepe/re-workbench
 ```
 
 Restart the app after install so the MCP server registers.
