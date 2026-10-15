@@ -12,8 +12,10 @@ Every number below was measured against a local server, not assumed.
 
 * Latency grows super-linearly with the length of `state`: 76 tokens took
   0.57 s, 241 tokens 1.61 s, 961 tokens 7.08 s, 3061 tokens 30.6 s. So evidence
-  is capped at ~150 tokens per item and callers are told the expected cost
-  before a batch runs.
+  is capped at ~150 tokens per item, the whole batch runs under one wall-clock
+  deadline (`DecisionConfig.max_seconds`), and the cost can be read BEFORE
+  paying it: `estimate_batch_seconds()` needs no server at all, and the ranking
+  tools take `dry_run=True` to return this batch's estimate without asking.
 * The returned `noul` value is banded: across 41 measurements every score
   landed inside [0.1774, 0.8384]. An absolute rule such as ">= 0.85 means yes"
   can therefore never fire. This module exposes no thresholds.
@@ -56,19 +58,27 @@ from urllib.parse import urlparse, urlunparse
 __all__ = [
     "CAVEATS",
     "MIN_REQUEST_SECONDS",
+    "DEFAULT_MAX_CONSECUTIVE_ERRORS",
+    "DEFAULT_MAX_SECONDS",
     "DEFAULT_MODEL",
     "DEFAULT_STRING_PATTERNS",
     "EVIDENCE_TEMPLATE_VERSION",
+    "FUNCTION_EVIDENCE_SHAPE",
     "MAX_EVIDENCE_TOKENS",
+    "SCORE_MAX",
+    "SCORE_MIN",
+    "STRING_EVIDENCE_SHAPE",
     "DecisionConfig",
     "DecisionConfigError",
     "DecisionUnavailable",
+    "EvidenceTooLong",
     "SystemOneClient",
     "clamp_evidence",
     "default_string_pattern",
     "estimate_batch_seconds",
     "estimate_latency_seconds",
     "estimate_tokens",
+    "evidence_shape",
     "function_evidence",
     "probe",
     "score_items",
@@ -88,10 +98,30 @@ DEFAULT_MODEL = "von-1.3"
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_MAX_ITEMS = 150
 
+#: Wall-clock ceiling for one WHOLE batch, not one request. Per-request
+#: timeouts are additive: measured, five items against a sleeping server with a
+#: 1 s per-request timeout took 5.03 s, so the defaults alone (150 items x 60 s)
+#: would let a single tool call block for 2.5 hours. Every batch therefore runs
+#: under this deadline and reports when it stopped early.
+DEFAULT_MAX_SECONDS = 300.0
+
+#: Stop asking after this many requests fail back to back: once the server has
+#: gone away, the rest of the batch only buys more timeouts.
+DEFAULT_MAX_CONSECUTIVE_ERRORS = 5
+
 #: Per-item evidence budget. Beyond this, latency stops being worth it.
 MAX_EVIDENCE_TOKENS = 150
 _CHARS_PER_TOKEN = 4
-_CLAMP_MARKER = " [clamped]"
+
+#: Truncation is marked inside the field whose value was cut, never by appending
+#: to the rendered text: a trailing marker would itself make a clamped item a
+#: different shape from an unclamped one. The `clamped` flag carries the signal.
+_TRUNCATION_MARKER = "~"
+
+#: The only scores the wire protocol may produce. Measured band is
+#: [0.1774, 0.8384]; anything outside [0, 1] is a protocol error, not a score.
+SCORE_MIN = 0.0
+SCORE_MAX = 1.0
 
 #: The wire type name of a yes/no-shaped question. Measured: {"type":
 #: "boolean"} is rejected with 422 "Unknown question type" by both the decision
@@ -140,6 +170,15 @@ class DecisionUnavailable(RuntimeError):
     """The decision server is not configured or could not be reached."""
 
 
+class EvidenceTooLong(ValueError):
+    """Evidence cannot be fitted to the budget without dropping a field label.
+
+    Measured fact 5 makes the field shape part of the comparison: an item whose
+    template fields are not all present is not comparable with the rest of the
+    batch, so it is refused rather than silently reshaped.
+    """
+
+
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
@@ -153,6 +192,9 @@ class DecisionConfig:
     model: str = DEFAULT_MODEL
     timeout: float = DEFAULT_TIMEOUT
     max_items: int = DEFAULT_MAX_ITEMS
+    #: Ceiling for the WHOLE batch. `timeout` alone is per request and additive.
+    max_seconds: float = DEFAULT_MAX_SECONDS
+    max_consecutive_errors: int = DEFAULT_MAX_CONSECUTIVE_ERRORS
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "DecisionConfig | None":
@@ -183,6 +225,18 @@ class DecisionConfig:
                     env.get("RE_WORKBENCH_DECISION_MAX_ITEMS"),
                     DEFAULT_MAX_ITEMS,
                     "RE_WORKBENCH_DECISION_MAX_ITEMS",
+                )
+            ),
+            max_seconds=_positive_float(
+                env.get("RE_WORKBENCH_DECISION_MAX_SECONDS"),
+                DEFAULT_MAX_SECONDS,
+                "RE_WORKBENCH_DECISION_MAX_SECONDS",
+            ),
+            max_consecutive_errors=int(
+                _positive_float(
+                    env.get("RE_WORKBENCH_DECISION_MAX_CONSECUTIVE_ERRORS"),
+                    DEFAULT_MAX_CONSECUTIVE_ERRORS,
+                    "RE_WORKBENCH_DECISION_MAX_CONSECUTIVE_ERRORS",
                 )
             ),
         )
@@ -241,15 +295,129 @@ def estimate_tokens(text: str) -> int:
     return math.ceil(len(text) / _CHARS_PER_TOKEN)
 
 
+#: Every label the templates below can emit, exactly as rendered. Clamping and
+#: shape comparison both work off these: counting ";" separators is wrong in
+#: both directions (function and string evidence both have five, so a mixed file
+#: looks uniform, while one ";" inside a referenced string makes two
+#: identically templated items look different).
+_FIELD_PREFIXES: tuple[str, ...] = (
+    "function ",
+    "size ",
+    "inbound refs ",
+    "imported calls: ",
+    "referenced strings: ",
+    "string ",
+    "section ",
+    "offset ",
+    "encoding ",
+)
+_SORTED_PREFIXES = tuple(sorted(_FIELD_PREFIXES, key=len, reverse=True))
+_FIELD_SEP = "; "
+_LIST_SEP = ", "
+
+#: The shapes the two templates produce, for callers that want to assert it.
+FUNCTION_EVIDENCE_SHAPE: tuple[str, ...] = (
+    "function",
+    "size",
+    "inbound refs",
+    "imported calls",
+    "referenced strings",
+)
+STRING_EVIDENCE_SHAPE: tuple[str, ...] = (
+    "string",
+    "section",
+    "offset",
+    "encoding",
+    "inbound refs",
+)
+
+
+def _parse_fields(text: str) -> list[list[str]] | None:
+    """Split templated evidence into [prefix, value] pairs on known labels.
+
+    A "; " that is not followed by a known label is part of the value before it,
+    so a semicolon inside a string literal does not invent a field. Returns None
+    when the text is not templated at all (first segment carries no label).
+    """
+    fields: list[list[str]] = []
+    for segment in text.split(_FIELD_SEP):
+        prefix = next((p for p in _SORTED_PREFIXES if segment.startswith(p)), None)
+        if prefix is None:
+            if not fields:
+                return None
+            fields[-1][1] += _FIELD_SEP + segment
+            continue
+        fields.append([prefix, segment[len(prefix) :]])
+    return fields
+
+
+def evidence_shape(text: str) -> tuple[str, ...]:
+    """The sequence of template field labels in `text`, or () if untemplated.
+
+    Two items are comparable only when this is equal for both: measured, the
+    class margin (0.0015) is smaller than paraphrase noise (0.0041), so a
+    missing field is not a detail.
+    """
+    fields = _parse_fields(str(text))
+    if fields is None:
+        return ()
+    return tuple(prefix.strip().rstrip(":") for prefix, _ in fields)
+
+
 def clamp_evidence(
     text: str, max_tokens: int = MAX_EVIDENCE_TOKENS
 ) -> tuple[str, bool]:
-    """Cut `text` down to the per-item budget. Returns (text, was_clamped)."""
+    """Fit `text` to the per-item budget WITHOUT losing a field label.
+
+    Returns (text, was_clamped). Cutting the tail off the rendered text is not
+    an option: it deletes whole trailing fields, and an item that is missing
+    `referenced strings` while the rest of the batch has it is not comparable
+    with the batch (measured fact: the class margin is smaller than the spread
+    from rewording the evidence). So trailing ELEMENTS of the longest
+    list-valued field go first, then the longest remaining value is truncated
+    in place, and every label survives. Raises EvidenceTooLong when the labels
+    alone do not fit, so the caller refuses the item instead of reshaping it.
+    """
     budget = max(1, int(max_tokens)) * _CHARS_PER_TOKEN
+    text = str(text)
     if len(text) <= budget:
         return text, False
-    keep = max(0, budget - len(_CLAMP_MARKER))
-    return text[:keep] + _CLAMP_MARKER, True
+
+    fields = _parse_fields(text)
+    if fields is None:
+        # Not templated evidence: there is no shape to protect, cut the tail.
+        return text[: max(1, budget - len(_TRUNCATION_MARKER))] + _TRUNCATION_MARKER, True
+
+    floor = (
+        sum(len(prefix) for prefix, _ in fields)
+        + len(_FIELD_SEP) * (len(fields) - 1)
+        + len(fields)  # one character of value per field, at the very least
+    )
+    if floor > budget:
+        raise EvidenceTooLong(
+            f"evidence has {len(fields)} template fields whose labels alone need "
+            f"{floor} characters, over the {budget}-character budget "
+            f"({max_tokens} tokens); refusing to drop a field label"
+        )
+
+    while True:
+        rendered = _FIELD_SEP.join(prefix + value for prefix, value in fields)
+        if len(rendered) <= budget:
+            return rendered, True
+        over = len(rendered) - budget
+        index = max(range(len(fields)), key=lambda j: (len(fields[j][1]), -j))
+        value = fields[index][1]
+        elements = value.split(_LIST_SEP)
+        if len(elements) > 1:
+            # Whole trailing list element: the remaining ones stay readable.
+            fields[index][1] = _LIST_SEP.join(elements[:-1])
+            continue
+        target = max(1, min(len(value) - over, len(value) - 1))
+        fields[index][1] = (
+            value[: target - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+            if target > len(_TRUNCATION_MARKER)
+            else _TRUNCATION_MARKER
+        )
 
 
 def _flatten(text: str) -> str:
@@ -382,6 +550,72 @@ def estimate_batch_seconds(item_count: int, tokens_per_item: int = MAX_EVIDENCE_
 # --------------------------------------------------------------------------
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect instead of following it.
+
+    normalize_url() validates the CONFIGURED url and nothing else. urllib's
+    default handler would follow a 301/302/303 from that loopback endpoint to
+    any other host, and no code re-validated the target: measured, a loopback
+    endpoint answering 302 got urllib to ask a different endpoint entirely and
+    the reply came back as `status: ok, model: OFF-HOST, score: 0.99` while the
+    envelope still reported the loopback url. (307/308 were already refused
+    because CPython will not replay a POST body, but that is an accident of the
+    method, not a guarantee.) Evidence assembled from the user's binaries must
+    not be able to leave the host by way of the endpoint's own reply, so the
+    redirect is an error here, at every status code.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            f"decision server answered {code} redirecting to {newurl!r}; "
+            "redirects are refused so evidence cannot leave the loopback host",
+            headers,
+            fp,
+        )
+
+
+def _finite_number(value: Any) -> float | None:
+    """`value` as a float when it is a finite real number, else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _validated_score(answer: Mapping[str, Any]) -> float:
+    """The answer's score, or DecisionUnavailable with the reason it is not one.
+
+    Three things that are not scores used to get through `isinstance(score,
+    (int, float))`:
+
+    * `True` — bool is a subclass of int, so a reply of {"noul": true} became
+      score 1.0, above every measured value (band max 0.8384), and ranked that
+      item first.
+    * NaN / Infinity — json.loads accepts the bare literals. NaN makes every
+      comparison false, so the sort comparator stops being transitive and the
+      CORRECTLY scored items of the batch come out in the wrong order too;
+      measured ranks from one such batch: 0.28, nan, 0.30, nan, 0.21, 0.32.
+      It also serialises as bare `NaN`, which is not JSON and breaks a strict
+      client reading the tool's output.
+    * Anything outside [0, 1] — not a probability, so not a score.
+    """
+    raw = answer.get(QUESTION_TYPE)
+    score = _finite_number(raw)
+    if score is None:
+        raise DecisionUnavailable(
+            f"decision server answer has no finite numeric {QUESTION_TYPE} "
+            f"(got {raw!r} of type {type(raw).__name__}): {dict(answer)!r}"
+        )
+    if not SCORE_MIN <= score <= SCORE_MAX:
+        raise DecisionUnavailable(
+            f"decision server {QUESTION_TYPE} {score!r} is outside "
+            f"[{SCORE_MIN}, {SCORE_MAX}]; that is not a score"
+        )
+    return score
+
+
 class SystemOneClient:
     """Minimal System One client over urllib. No third-party dependency."""
 
@@ -393,9 +627,14 @@ class SystemOneClient:
             model=config.model,
             timeout=config.timeout,
             max_items=config.max_items,
+            max_seconds=config.max_seconds,
+            max_consecutive_errors=config.max_consecutive_errors,
         )
-        # Explicitly proxy-free: a loopback request must not be routed out.
-        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        # Explicitly proxy-free: a loopback request must not be routed out, and
+        # redirects are refused so the endpoint cannot forward us off-host.
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _RefuseRedirects()
+        )
 
     def ask(
         self,
@@ -439,6 +678,8 @@ class SystemOneClient:
                 detail = exc.read().decode("utf-8", "replace")[:400]
             except Exception:
                 pass
+            finally:
+                exc.close()
             raise DecisionUnavailable(
                 f"decision server returned HTTP {exc.code}: {detail or exc.reason}"
             ) from exc
@@ -457,14 +698,16 @@ class SystemOneClient:
                 f"decision server answer missing question {question_id!r}"
             )
         answer = answers[question_id] or {}
-        score = answer.get(QUESTION_TYPE)
-        if not isinstance(score, (int, float)):
+        if not isinstance(answer, Mapping):
             raise DecisionUnavailable(
-                f"decision server answer has no numeric {QUESTION_TYPE}: {answer!r}"
+                f"decision server answer for {question_id!r} is not an object: "
+                f"{answer!r}"
             )
         return {
-            "score": float(score),
-            "raw": answer.get(f"{QUESTION_TYPE}_raw"),
+            "score": _validated_score(answer),
+            # The raw value travels for information only; a non-finite one would
+            # serialise as bare NaN/Infinity and break a strict JSON reader.
+            "raw": _finite_number(answer.get(f"{QUESTION_TYPE}_raw")),
             "model": data.get("model"),
             "usage": data.get("usage") or {},
             "elapsed_s": round(elapsed, 3),
@@ -497,6 +740,14 @@ def score_items(
     Measured: ranking several candidates inside one call inverts the order, so
     batching into a single request is not an option.
 
+    The whole batch runs under ONE wall-clock deadline (`config.max_seconds`),
+    and stops early after `config.max_consecutive_errors` failures in a row.
+    Per-request timeouts are additive, so without a deadline the defaults alone
+    (150 items x 60 s) let a single call block for 2.5 hours; measured, five
+    items against a sleeping server with a 1 s per-request timeout took 5.03 s.
+    An item that was never asked about is recorded with score None and the
+    reason, so nothing is dropped and nothing is silently missing.
+
     Never raises for an unreachable server: returns status "unavailable" so the
     caller can fall back to its deterministic order and still return every item.
     """
@@ -514,30 +765,85 @@ def score_items(
     except DecisionConfigError as exc:
         return unavailable(str(exc), cfg)
 
+    total = len(items)
+    if not total:
+        # No request was made, so there is nothing to call "ok": a dead but
+        # configured server used to come back here as status ok with the
+        # configured model name, which claimed model ordering that never ran.
+        envelope = unavailable("no items to score; no request was made", cfg)
+        envelope["status"] = "empty"
+        envelope["model"] = None
+        envelope["configured_model"] = cfg.model
+        envelope["requested"] = 0
+        envelope["scored"] = 0
+        envelope["scores"] = {}
+        return envelope
+
     scores: dict[str, dict[str, Any]] = {}
     errors: list[dict[str, str]] = []
     in_tokens = out_tokens = requests = clamped = 0
+    consecutive_errors = 0
     served_model: str | None = None
+    abort_reason: str | None = None
     budget = cfg.max_items
     started = time.monotonic()
+    shapes: set[tuple[str, ...]] = set()
 
     for index, item in enumerate(items):
         key = str(item.get("key", index))
-        evidence, was_clamped = clamp_evidence(str(item.get("evidence", "")))
-        if was_clamped:
-            clamped += 1
-        if index >= budget:
+        raw_evidence = str(item.get("evidence", ""))
+        try:
+            evidence, was_clamped = clamp_evidence(raw_evidence)
+        except EvidenceTooLong as exc:
+            # Refusing beats reshaping: an item missing a template field is not
+            # comparable with the rest of the batch.
+            message = f"not scored: {exc}"
+            errors.append({"key": key, "error": message})
+            scores[key] = {
+                "score": None,
+                "evidence": raw_evidence,
+                "clamped": False,
+                "error": message,
+            }
+            continue
+        shapes.add(evidence_shape(evidence))
+
+        reason = abort_reason
+        if reason is None and index >= budget:
+            reason = f"max_items={budget} reached"
+        if reason is None:
+            remaining = cfg.max_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                abort_reason = reason = (
+                    f"batch deadline of {cfg.max_seconds}s reached"
+                )
+        if reason is not None:
             scores[key] = {
                 "score": None,
                 "evidence": evidence,
                 "clamped": was_clamped,
-                "error": f"not scored: max_items={budget} reached",
+                "error": f"not scored: {reason}",
             }
             continue
+
+        clamped += was_clamped
+        # The deadline, not the per-request timeout, is what a long batch hits.
+        deadline_limited = remaining < cfg.timeout
         try:
-            answer = client.ask(evidence, question_id, instructions, criteria)
+            answer = client.ask(
+                evidence,
+                question_id,
+                instructions,
+                criteria,
+                timeout=min(cfg.timeout, remaining),
+            )
         except DecisionUnavailable as exc:
             message = str(exc)
+            if deadline_limited:
+                message += (
+                    f" (request cut short by the batch deadline of "
+                    f"{cfg.max_seconds}s)"
+                )
             errors.append({"key": key, "error": message})
             scores[key] = {
                 "score": None,
@@ -545,7 +851,14 @@ def score_items(
                 "clamped": was_clamped,
                 "error": message,
             }
+            consecutive_errors += 1
+            if consecutive_errors >= cfg.max_consecutive_errors:
+                abort_reason = (
+                    f"{consecutive_errors} requests failed in a row "
+                    f"(max_consecutive_errors={cfg.max_consecutive_errors})"
+                )
             continue
+        consecutive_errors = 0
         requests += 1
         served_model = served_model or answer.get("model")
         usage = answer.get("usage") or {}
@@ -559,17 +872,20 @@ def score_items(
             "elapsed_s": answer.get("elapsed_s"),
         }
 
-    total = len(items)
-    if requests == 0 and total:
+    if requests == 0:
         envelope = unavailable(
             errors[0]["error"] if errors else "no item could be scored", cfg
         )
         envelope["requested"] = total
         envelope["scored"] = 0
         envelope["scores"] = scores
+        envelope["errors"] = errors
+        envelope["elapsed_s"] = round(time.monotonic() - started, 2)
+        if abort_reason:
+            envelope["aborted"] = abort_reason
         return envelope
 
-    return {
+    out: dict[str, Any] = {
         "status": "ok" if requests == total else "partial",
         "model": served_model or cfg.model,
         "url": cfg.url,
@@ -578,8 +894,11 @@ def score_items(
         "instructions": instructions,
         "requested": total,
         "scored": requests,
+        "unscored": total - requests,
         "clamped_evidence": clamped,
+        "evidence_shapes_sent": sorted(list(shape) for shape in shapes),
         "max_items": budget,
+        "max_seconds": cfg.max_seconds,
         "errors": errors,
         "usage": {
             "requests": requests,
@@ -590,6 +909,14 @@ def score_items(
         "scores": scores,
         "caveats": list(CAVEATS),
     }
+    if abort_reason:
+        out["aborted"] = abort_reason
+    if len(shapes) > 1:
+        out["evidence_shape_warning"] = (
+            f"{len(shapes)} different evidence field shapes were sent in one "
+            "batch; scores are only comparable within one template shape"
+        )
+    return out
 
 
 def probe(
@@ -635,4 +962,6 @@ def probe(
         "probe_elapsed_s": answer.get("elapsed_s"),
         "timeout_s": cfg.timeout,
         "max_items": cfg.max_items,
+        "max_seconds": cfg.max_seconds,
+        "max_consecutive_errors": cfg.max_consecutive_errors,
     }
