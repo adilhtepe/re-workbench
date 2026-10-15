@@ -66,13 +66,27 @@ configured they return the same full list in deterministic order. Check with
 **What they are for.** Deciding which of 40 candidates to decompile first, when
 reference counts and string classes alone leave you with a flat list. One
 request per item, roughly a second each, so a 50-function batch costs about a
-minute — `decision_status()` and the tools' own output tell you the expected
-cost before the batch runs.
+minute.
+
+**Check the cost before you pay it.** `decision_status()` gives the per-batch
+estimate, and `rank_functions(..., dry_run=True)` / `rank_strings(...,
+dry_run=True)` return this batch's estimate together with the deterministic
+list, without sending a single request. The `elapsed_s` in a normal result is a
+measurement after the fact, not a warning. A whole batch also runs under one
+wall-clock deadline (300 s by default, `RE_WORKBENCH_DECISION_MAX_SECONDS`), and
+says so in `aborted` when it stops early.
 
 **What they are NOT.** They are not a verdict and not a filter:
 
-- Nothing is dropped, hidden or filtered by score. The output always contains
-  every candidate that passed the deterministic pre-filter.
+- Nothing is dropped, hidden or filtered **by score**. The output always
+  contains every candidate that reached the scoring step.
+- Candidate **selection** is a filter, and it runs first: `limit` defaults to 50
+  for functions and 150 for strings. Read `functions_total` /
+  `strings_extracted` against `candidates_selected` to see how many never
+  reached the list. Absent from the output means "not selected", never
+  "unimportant".
+- An item with `rank: null` was never asked about (deadline, `max_items`, a
+  failed request). That is not a low rank.
 - **A low score is not a "no".** Measured: the textbook true positive of an
   embedded binary (96 bytes, 14 inbound refs, only `memcpy`) scored 0.1790 and
   came last of nine candidates. Never skip a function because it ranked low.
@@ -100,9 +114,11 @@ template precisely because the class margin (0.0015) measured smaller than the
 spread from rewording the same facts (0.0041). Whether *your* question
 separates *your* binaries is an open question until you label a few dozen items
 and run `eval/calibrate.py`, which reports AUC, top-k recall, the per-class
-score ranges and an explicit verdict on whether the question discriminates. Do
-that first; until then treat the order as a hint and your own reading of the
-code as the evidence.
+score ranges and an explicit verdict on whether the question discriminates.
+Below 30 labelled items it refuses to give a verdict at all and says
+"unknown" — ten hand-written rows cannot tell you anything, however clean the
+AUC looks. Do that first; until then treat the order as a hint and your own
+reading of the code as the evidence.
 
 ## Going deeper by artifact type
 
