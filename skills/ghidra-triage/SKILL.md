@@ -58,6 +58,13 @@ self-modifying code, tight crypto loops).
 
 ## Optional: ranking tools (`rank_functions`, `rank_strings`)
 
+**It is a two-way split, not a fine ranking.** Measured on a six-function batch with one
+question: three items scored 0.8184-0.8198 and three scored 0.1845-0.1847 — a gap of 0.63
+between the groups and 0.0014 inside the top group, which is below the 0.0041 spread the same
+facts produce when the wording changes. Read which group an item landed in. The order inside a
+group carries no measured signal: in that batch the highest score went to a logging helper,
+above the HTTP header parser.
+
 If a local decision model is configured (`RE_WORKBENCH_DECISION_URL`), two
 extra tools will **order** a candidate list by one question. If it is not
 configured they return the same full list in deterministic order. Check with

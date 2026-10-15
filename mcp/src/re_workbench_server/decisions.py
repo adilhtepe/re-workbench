@@ -157,6 +157,11 @@ CAVEATS: tuple[str, ...] = (
     f"produced by the same evidence template ({EVIDENCE_TEMPLATE_VERSION}).",
     "The class margin measured smaller than paraphrase noise (0.0015 vs "
     "0.0041), so treat small differences in rank as noise.",
+    "In practice the answer is a two-way split, not a fine ranking: a six "
+    "function batch scored 0.8184-0.8198 and 0.1845-0.1847, i.e. a gap of "
+    "0.63 between the groups and 0.0014 inside one. Read which group an item "
+    "landed in; the order inside a group carries no measured signal, and the "
+    "top item of the high group was a logging helper, not the HTTP parser.",
     "Calibrate the question against your own labelled data with eval/calibrate.py "
     "before giving any weight to the order.",
 )

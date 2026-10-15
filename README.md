@@ -98,6 +98,13 @@ env:     GHIDRA_INSTALL_DIR=/path/to/ghidra  JAVA_HOME=/path/to/jdk-21
 
 ## Optional decision-model ranking
 
+**It is a two-way split, not a fine ranking.** Measured on a six-function batch with one
+question: three items scored 0.8184-0.8198 and three scored 0.1845-0.1847 — a gap of 0.63
+between the groups and 0.0014 inside the top group, which is below the 0.0041 spread the same
+facts produce when the wording changes. Read which group an item landed in. The order inside a
+group carries no measured signal: in that batch the highest score went to a logging helper,
+above the HTTP header parser.
+
 Two extra tools, `rank_functions` and `rank_strings`, will **order** a
 candidate list by one question using a local decision model (a small encoder
 answering one yes/no-shaped question per forward pass, not a language model).
