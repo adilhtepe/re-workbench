@@ -15,10 +15,14 @@ Input: JSONL, one object per line, each {"evidence": "...", "label": 0|1}.
 Lines carrying a "_comment" key, blank lines and lines without a "label" are
 skipped. Build "evidence" with the SAME template the server uses
 (re_workbench_server.decisions.function_evidence / string_evidence) — scores
-produced from differently worded evidence are not comparable.
+produced from differently worded evidence are not comparable, and the runner
+warns when the rows do not all have the same template field labels. An optional
+"key" is a label for the report only; rows are matched to their scores by
+position, so a repeated key cannot make one row take another's score.
 
 Output: ROC AUC, top-k recall, per-class score ranges, and an explicit verdict
-on whether the question discriminates on this data.
+on whether the question discriminates on this data. Below 30 labelled items the
+verdict is "unknown": the AUC is still printed, but it is not a result.
 
 Usage:
     RE_WORKBENCH_DECISION_URL=http://127.0.0.1:8009 \\
@@ -46,8 +50,23 @@ PARAPHRASE_NOISE = 0.0041
 #: Measured class margin of a question that did not work (for comparison).
 MEASURED_FAILED_MARGIN = 0.0015
 
+#: Below this many labelled items there is no verdict to give, only an AUC.
+MIN_LABELLED_ITEMS = 30
+
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Read the labelled rows, each with a score key that is unique by
+    construction.
+
+    The user's "key" is a label for reading the report, nothing else. It used
+    to be the dictionary key the scores came back under, and nothing checked it
+    for uniqueness: two rows keyed the same silently overwrote each other, so
+    one row was reported with the OTHER row's score. Measured on a two-line
+    file both keyed "same" (one true positive, one true negative): both rows
+    were given 0.1878, AUC came out 0.500 instead of 1.000, and the verdict
+    read "no - this question does not separate your data" about a question
+    that separated it perfectly.
+    """
     rows: list[dict[str, Any]] = []
     for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = line.strip()
@@ -70,6 +89,9 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
             raise SystemExit(f"{path}:{lineno}: 'label' must be 0 or 1, got {label}")
         rows.append(
             {
+                # score_key is positional and therefore unique; key is for the
+                # human reading the report.
+                "score_key": f"row{len(rows)}",
                 "key": str(obj.get("key") or f"line{lineno}"),
                 "evidence": evidence,
                 "label": label,
@@ -77,6 +99,14 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def duplicate_keys(rows: Sequence[dict[str, Any]]) -> dict[str, list[int]]:
+    """Display keys used by more than one row, with their line numbers."""
+    seen: dict[str, list[int]] = {}
+    for row in rows:
+        seen.setdefault(row["key"], []).append(row["line"])
+    return {key: lines for key, lines in seen.items() if len(lines) > 1}
 
 
 def roc_auc(pos: Sequence[float], neg: Sequence[float]) -> float | None:
@@ -129,16 +159,30 @@ def verdict(
     n = len(pos) + len(neg)
     notes: list[str] = []
 
+    if n < MIN_LABELLED_ITEMS:
+        # This used to be a note under a green "yes", which is the exact shape
+        # of false confidence the whole runner exists to prevent: the README's
+        # own first example (a ten-line hand-written fixture that proves
+        # nothing) printed "DISCRIMINATES? yes, for ordering only".
+        return {
+            "discriminates": f"unknown - too few labelled items ({n})",
+            "reason": (
+                f"AUC {auc:.3f} with class margin {margin:+.4f} on {n} labelled "
+                f"items. Below {MIN_LABELLED_ITEMS} items an AUC this far from "
+                "0.5 happens by chance often enough that it is not a result; "
+                "label more data before reading anything into the order."
+            ),
+            "auc": round(auc, 4),
+            "class_margin_median": round(margin, 4),
+            "labelled_items": n,
+            "notes": notes,
+        }
+
     if abs(margin) < PARAPHRASE_NOISE:
         notes.append(
             f"class margin {margin:+.4f} is inside the measured paraphrase noise "
             f"({PARAPHRASE_NOISE}): indistinguishable from rewording the evidence "
             f"(a question measured as non-working had margin {MEASURED_FAILED_MARGIN})"
-        )
-    if n < 30:
-        notes.append(
-            f"only {n} labelled items: too few to conclude, label more before "
-            "acting on this"
         )
     if overlap:
         notes.append(
@@ -204,7 +248,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"no labelled rows in {args.data}", file=sys.stderr)
         return 2
 
-    shapes = {len(r["evidence"].split(";")) for r in rows}
+    # Field LABELS, not ";" counts. Counting separators is wrong in both
+    # directions: function and string evidence both split into exactly five, so
+    # a file mixing the two templates passed silently, while one ";" inside a
+    # referenced string made two identically templated rows look different.
+    shapes = sorted({decisions.evidence_shape(r["evidence"]) for r in rows})
+    untemplated = [r["line"] for r in rows if not decisions.evidence_shape(r["evidence"])]
+    duplicates = duplicate_keys(rows)
+
     n_pos = sum(r["label"] for r in rows)
     announced = decisions.estimate_batch_seconds(
         len(rows), max(decisions.estimate_tokens(r["evidence"]) for r in rows)
@@ -216,7 +267,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     scoring = decisions.score_items(
-        [{"key": r["key"], "evidence": r["evidence"]} for r in rows],
+        [{"key": r["score_key"], "evidence": r["evidence"]} for r in rows],
         args.question_id,
         args.question,
     )
@@ -227,24 +278,51 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 3
 
     scores = scoring.get("scores") or {}
-    scored = [r for r in rows if (scores.get(r["key"]) or {}).get("score") is not None]
-    for r in scored:
-        r["score"] = scores[r["key"]]["score"]
+    scored = [
+        r for r in rows if (scores.get(r["score_key"]) or {}).get("score") is not None
+    ]
+    for r in rows:
+        entry = scores.get(r["score_key"]) or {}
+        r["score"] = entry.get("score")
+        r["clamped"] = bool(entry.get("clamped"))
+        if entry.get("error"):
+            r["error"] = entry["error"]
     if not scored:
         print("no item could be scored", file=sys.stderr)
         return 3
 
+    clamped_rows = [r["line"] for r in rows if r.get("clamped")]
+    unscored_rows = [
+        {"line": r["line"], "key": r["key"], "error": r.get("error")}
+        for r in rows
+        if r["score"] is None
+    ]
+
     pos = [r["score"] for r in scored if r["label"] == 1]
     neg = [r["score"] for r in scored if r["label"] == 0]
-    ranked = sorted(scored, key=lambda r: -r["score"])
+    # Tie-break on the score key, never on input order: resolving ties by the
+    # order the rows happen to appear in makes top-k recall depend on how the
+    # file was written. AUC already counts a tie as half, so only top-k needed
+    # fixing.
+    ranked = sorted(scored, key=lambda r: (-r["score"], r["score_key"]))
     labels = [r["label"] for r in ranked]
+    tied = len(ranked) - len({r["score"] for r in ranked})
 
-    ks = []
+    ks: list[int] = []
+    oversized: list[int] = []
     for part in str(args.top_k).split(","):
         part = part.strip()
-        if part.isdigit() and 0 < int(part) <= len(ranked):
-            ks.append(int(part))
-    recall = {f"top_{k}": top_k_recall(labels, k) for k in sorted(set(ks))}
+        if not part:
+            continue
+        if not part.isdigit() or int(part) == 0:
+            raise SystemExit(f"--top-k: {part!r} is not a positive integer")
+        k = int(part)
+        if k > len(ranked):
+            # Kept, not dropped: a k larger than the item count used to vanish
+            # from the report with nothing saying it had been skipped.
+            oversized.append(k)
+        ks.append(k)
+    recall = {f"top_{k}": top_k_recall(labels, min(k, len(ranked))) for k in sorted(set(ks))}
 
     auc = roc_auc(pos, neg)
     overlap = bool(pos and neg and min(pos) <= max(neg) and min(neg) <= max(pos))
@@ -257,9 +335,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "evidence must come from the same template as the ranking tools; "
             f"server template is {decisions.EVIDENCE_TEMPLATE_VERSION}"
         ),
-        "evidence_field_shapes_seen": sorted(shapes),
+        "evidence_field_shapes_seen": [list(shape) for shape in shapes],
+        "evidence_shapes_consistent": len(shapes) == 1 and not untemplated,
         "items": len(rows),
         "scored": len(scored),
+        "clamped_evidence": scoring.get("clamped_evidence", 0),
+        "clamped_lines": clamped_rows,
+        "unscored": unscored_rows,
+        "duplicate_keys": duplicates,
+        "tied_scores": tied,
         "elapsed_s": scoring.get("elapsed_s"),
         "auc": round(auc, 4) if auc is not None else None,
         "positive_scores": summarize(pos),
@@ -269,12 +353,59 @@ def main(argv: Sequence[str] | None = None) -> int:
             k: (round(v, 4) if v is not None else None) for k, v in recall.items()
         },
         "ranking": [
-            {"rank": i, "score": round(r["score"], 4), "label": r["label"], "key": r["key"]}
+            {
+                "rank": i,
+                "score": round(r["score"], 4),
+                "label": r["label"],
+                "key": r["key"],
+                "line": r["line"],  # the key may repeat; the line never does
+            }
             for i, r in enumerate(ranked, start=1)
         ],
         "verdict": verdict(auc, pos, neg, overlap),
         "caveats": list(decisions.CAVEATS),
     }
+    warnings: list[str] = []
+    if len(shapes) > 1:
+        warnings.append(
+            f"evidence rows use {len(shapes)} different field shapes "
+            f"({' | '.join(', '.join(s) for s in shapes)}); scores are only "
+            "comparable within one template shape"
+        )
+    if untemplated:
+        warnings.append(
+            f"{len(untemplated)} row(s) carry no recognised template field at "
+            f"all (lines {untemplated[:10]}); render evidence with "
+            "decisions.function_evidence / string_evidence"
+        )
+    if duplicates:
+        warnings.append(
+            f"{len(duplicates)} 'key' value(s) are used by more than one row "
+            f"({duplicates}); keys are only labels here, scores are matched by "
+            "row position, but the report will be hard to read"
+        )
+    if clamped_rows:
+        warnings.append(
+            f"{len(clamped_rows)} row(s) were clamped to the "
+            f"{decisions.MAX_EVIDENCE_TOKENS}-token budget (lines "
+            f"{clamped_rows[:10]}); every field label survives but the values "
+            "were shortened, so these rows are not byte-identical to what you "
+            "wrote"
+        )
+    if unscored_rows:
+        warnings.append(
+            f"{len(unscored_rows)} row(s) could not be scored and are excluded "
+            f"from every number below (lines {[r['line'] for r in unscored_rows][:10]})"
+        )
+    if scoring.get("aborted"):
+        warnings.append(f"the batch stopped early: {scoring['aborted']}")
+    if oversized:
+        warnings.append(
+            f"--top-k {sorted(set(oversized))} exceeds the {len(ranked)} scored "
+            "items, so those rows cover the whole ranking and read 1.0 by "
+            "definition"
+        )
+    report["warnings"] = warnings
 
     if args.json:
         print(json.dumps(report, indent=2))
@@ -283,17 +414,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     v = report["verdict"]
     print(f"model             {report['model']}")
     print(f"scored            {report['scored']}/{report['items']} in {report['elapsed_s']}s")
-    if len(shapes) > 1:
-        print(
-            f"WARNING           evidence lines have {len(shapes)} different field "
-            "shapes; scores are only comparable within one template"
-        )
+    print(f"evidence shape    {' | '.join(', '.join(s) for s in shapes) or '(untemplated)'}")
+    for warning in warnings:
+        print(f"WARNING           {warning}")
     print(f"AUC               {report['auc']}")
     print(f"positives         {report['positive_scores']}")
     print(f"negatives         {report['negative_scores']}")
     print(f"ranges overlap    {report['ranges_overlap']}")
     for k, val in report["top_k_recall"].items():
         print(f"{k + ' recall':<18}{val}")
+    if report["tied_scores"]:
+        print(f"tied scores       {report['tied_scores']} (tie-break is by key, not input order)")
     print()
     print(f"DISCRIMINATES?    {v['discriminates']}")
     print(f"                  {v['reason']}")
@@ -301,8 +432,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"  note            {note}")
     print()
     print("ranking (score, label, key):")
-    for row in report["ranking"]:
-        print(f"  {row['rank']:>3}  {row['score']:.4f}  label={row['label']}  {row['key']}")
+    for row in report["ranking"]:  # ties already broken deterministically
+        print(
+            f"  {row['rank']:>3}  {row['score']:.4f}  label={row['label']}  "
+            f"{row['key']} (line {row['line']})"
+        )
     return 0
 
 
