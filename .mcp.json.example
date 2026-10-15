@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "re-workbench": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/re-workbench/mcp", "re-workbench-server"],
+      "env": {
+        "GHIDRA_INSTALL_DIR": "/path/to/ghidra_12.1.3_PUBLIC",
+        "JAVA_HOME": "/path/to/jdk-21"
+      }
+    }
+  }
+}

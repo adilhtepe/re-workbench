@@ -5,3 +5,4 @@ re-findings/
 .claude-flow/
 .claude/
 mcp/.claude-flow/
+.mcp.json
