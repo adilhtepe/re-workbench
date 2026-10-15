@@ -1,11 +1,28 @@
 {
+  "_comment": [
+    "Optional decision-model ranking (rank_functions / rank_strings) stays OFF",
+    "while RE_WORKBENCH_DECISION_URL is empty, and every other tool works",
+    "unchanged without it. Set it to a LOOPBACK endpoint only (127.0.0.1,",
+    "localhost or ::1) - any other host is refused before a request is made, so",
+    "evidence from your binaries does not leave the machine. /v1/systemone is",
+    "appended when the URL has no path. The other three variables are optional",
+    "and shown here at their defaults: model name, per-request timeout in",
+    "seconds, and the cap on requests per call (one request per item, measured",
+    "at about 0.9 s each). Ranking is an ordering hint only - calibrate it on",
+    "your own labelled data with eval/calibrate.py before relying on it."
+  ],
   "mcpServers": {
     "re-workbench": {
       "command": "uv",
       "args": ["run", "--directory", "/path/to/re-workbench/mcp", "re-workbench-server"],
       "env": {
         "GHIDRA_INSTALL_DIR": "/path/to/ghidra_12.1.3_PUBLIC",
-        "JAVA_HOME": "/path/to/jdk-21"
+        "JAVA_HOME": "/path/to/jdk-21",
+
+        "RE_WORKBENCH_DECISION_URL": "",
+        "RE_WORKBENCH_DECISION_MODEL": "von-1.3",
+        "RE_WORKBENCH_DECISION_TIMEOUT": "60",
+        "RE_WORKBENCH_DECISION_MAX_ITEMS": "150"
       }
     }
   }
