@@ -18,5 +18,14 @@
   ],
   "skills": "./skills/",
   "agents": "./agents/",
-  "mcpServers": "./.mcp.json"
+  "mcpServers": {
+    "re-workbench": {
+      "command": "uv",
+      "args": ["run", "--directory", "${CLAUDE_PLUGIN_ROOT}/mcp", "re-workbench-server"],
+      "env": {
+        "GHIDRA_INSTALL_DIR": "${GHIDRA_INSTALL_DIR}",
+        "JAVA_HOME": "${JAVA_HOME}"
+      }
+    }
+  }
 }
