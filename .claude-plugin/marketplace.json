@@ -1,16 +1,14 @@
 {
   "name": "re-workbench",
+  "description": "Ghidra-powered reverse engineering & firmware analysis workbench — headless decompilation, binary triage, firmware/IoT recon, and autonomous RE as MCP tools",
+  "version": "0.1.0",
   "owner": {
     "name": "adilhtepe"
-  },
-  "metadata": {
-    "description": "Ghidra-powered reverse engineering & firmware analysis workbench — headless decompilation, binary triage, firmware/IoT recon, and autonomous RE as MCP tools",
-    "version": "0.1.0"
   },
   "plugins": [
     {
       "name": "re-workbench",
-      "source": "./.claude-plugin",
+      "source": "./",
       "description": "Headless Ghidra decompilation, binary triage, firmware/IoT recon, and autonomous RE — as MCP tools, skills, and an agent"
     }
   ]
